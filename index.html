@@ -345,6 +345,8 @@
   </div>
   <div class="header-date" id="headerDate"></div>
 </div>
+<div id="loadingBar" style="display:none;height:4px;background:linear-gradient(90deg,#FF6B6B,#4ECDC4,#FF6B6B);background-size:200%;animation:loadingAnim 1s linear infinite;"></div>
+<style>@keyframes loadingAnim{0%{background-position:0%}100%{background-position:200%}}</style>
 
 <!-- NAV TABS -->
 <div class="nav-tabs">
@@ -545,8 +547,10 @@
 
 <script>
 // ===================== STATE =====================
-let children = JSON.parse(localStorage.getItem('children') || '[]');
-let attendance = JSON.parse(localStorage.getItem('attendance') || '[]');
+const API_URL = 'https://script.google.com/macros/s/AKfycbyIHAUeSKz-ig3zgYIWxqtWbpftsjPzEpenpeVR0pWFFq0e4FPESUZIN7VVsWRH8uJW/exec';
+
+let children = [];
+let attendance = [];
 let scanning = false;
 let videoStream = null;
 let scanInterval = null;
@@ -557,16 +561,50 @@ let lastScannedTime = 0;
 const COLORS = ['#FF6B6B','#4ECDC4','#A855F7','#FFE66D','#48BB78','#ED8936','#3B82F6','#EC4899'];
 const AVATARS = ['👦','👧','🧒','👦🏽','👧🏽','🧒🏽','👦🏿','👧🏿'];
 
+// ===================== API =====================
+async function apiGet(params) {
+  const url = API_URL + '?' + new URLSearchParams(params);
+  const res = await fetch(url);
+  return res.json();
+}
+
+async function apiPost(body) {
+  const res = await fetch(API_URL, { method: 'POST', body: JSON.stringify(body) });
+  return res.json();
+}
+
+async function loadChildren() {
+  const data = await apiGet({ action: 'getChildren' });
+  if (data.children) children = data.children;
+}
+
+async function loadAttendance() {
+  const data = await apiGet({ action: 'getAttendance' });
+  if (data.attendance) attendance = data.attendance;
+}
+
 // ===================== INIT =====================
-function init() {
+async function init() {
   updateHeaderDate();
   setInterval(updateHeaderDate, 60000);
   populateMonthSelector();
+  showLoading(true);
+  try {
+    await loadChildren();
+    await loadAttendance();
+  } catch(e) {
+    showNotif('⚠️ Error al conectar con Google Sheets');
+  }
+  showLoading(false);
   renderChildren();
   renderQRCodes();
   renderTodayAttendance();
   renderHistory();
   updateMonthStats();
+}
+
+function showLoading(on) {
+  document.getElementById('loadingBar').style.display = on ? 'block' : 'none';
 }
 
 function updateHeaderDate() {
@@ -637,7 +675,7 @@ function scanFrame() {
   }
 }
 
-function processCode(code) {
+async function processCode(code) {
   const child = children.find(c => c.id === code || c.id === code.trim());
   if (!child) {
     showScanResult('error', `❌ Código no reconocido: ${code}`);
@@ -658,11 +696,21 @@ function processCode(code) {
     time: now.toLocaleTimeString('es-ES', { hour:'2-digit', minute:'2-digit' }),
     month: getMonthStr(now)
   };
-  attendance.push(record);
-  saveAttendance();
-  showScanResult('success', `✅ ¡Bienvenido, ${child.name}! — ${record.time}`);
-  renderTodayAttendance();
-  showNotif(`✅ Asistencia de ${child.name} registrada`);
+  showLoading(true);
+  try {
+    const res = await apiPost({ action: 'addAttendance', ...record });
+    if (res.duplicate) {
+      showScanResult('warning', `⚠️ ${child.name} ya fue registrado hoy (${res.time})`);
+    } else {
+      attendance.push(record);
+      showScanResult('success', `✅ ¡Bienvenido, ${child.name}! — ${record.time}`);
+      renderTodayAttendance();
+      showNotif(`✅ Asistencia de ${child.name} registrada`);
+    }
+  } catch(e) {
+    showScanResult('error', '❌ Error al guardar asistencia');
+  }
+  showLoading(false);
 }
 
 function showScanResult(type, msg) {
@@ -691,7 +739,7 @@ function generateId() {
   return 'NINO-' + (children.length + 1).toString().padStart(3, '0') + '-' + Date.now().toString(36).toUpperCase().slice(-4);
 }
 
-function addChild() {
+async function addChild() {
   const name = document.getElementById('childName').value.trim();
   if (!name) { showNotif('⚠️ El nombre es obligatorio'); return; }
   const child = {
@@ -701,17 +749,23 @@ function addChild() {
     grade: document.getElementById('childGrade').value.trim() || '',
     parent: document.getElementById('childParent').value.trim() || '',
     color: COLORS[children.length % COLORS.length],
-    avatar: AVATARS[children.length % AVATARS.length],
-    createdAt: new Date().toISOString()
+    avatar: AVATARS[children.length % AVATARS.length]
   };
-  children.push(child);
-  saveChildren();
-  document.getElementById('childName').value = '';
-  document.getElementById('childAge').value = '';
-  document.getElementById('childGrade').value = '';
-  document.getElementById('childParent').value = '';
-  renderChildren();
-  showNotif(`✅ ${child.name} registrado con ID: ${child.id}`);
+  showLoading(true);
+  try {
+    await apiPost({ action: 'addChild', ...child });
+    children.push(child);
+    document.getElementById('childName').value = '';
+    document.getElementById('childAge').value = '';
+    document.getElementById('childGrade').value = '';
+    document.getElementById('childParent').value = '';
+    renderChildren();
+    renderQRCodes();
+    showNotif(`✅ ${child.name} registrado con ID: ${child.id}`);
+  } catch(e) {
+    showNotif('❌ Error al guardar en Google Sheets');
+  }
+  showLoading(false);
 }
 
 function renderChildren() {
@@ -743,13 +797,19 @@ function showDelete(id) {
   document.getElementById('deleteModal').classList.add('active');
 }
 
-function confirmDelete() {
-  children = children.filter(c => c.id !== deleteTargetId);
-  attendance = attendance.filter(a => a.childId !== deleteTargetId);
-  saveChildren(); saveAttendance();
-  closeModal('deleteModal');
-  renderChildren(); renderTodayAttendance();
-  showNotif('🗑️ Niño eliminado correctamente');
+async function confirmDelete() {
+  showLoading(true);
+  try {
+    await apiPost({ action: 'deleteChild', id: deleteTargetId });
+    children = children.filter(c => c.id !== deleteTargetId);
+    attendance = attendance.filter(a => a.childId !== deleteTargetId);
+    closeModal('deleteModal');
+    renderChildren(); renderTodayAttendance(); renderQRCodes();
+    showNotif('🗑️ Niño eliminado correctamente');
+  } catch(e) {
+    showNotif('❌ Error al eliminar');
+  }
+  showLoading(false);
 }
 
 // ===================== QR CODES =====================
@@ -759,14 +819,19 @@ function renderQRCodes() {
     grid.innerHTML = '<div class="empty-state" style="grid-column:1/-1"><div class="empty-icon">📱</div><p>Registra niños para generar sus códigos QR</p></div>';
     return;
   }
-  grid.innerHTML = children.map(c => `
-    <div class="qr-item" id="qritem-${c.id}">
-      <div id="qr-${c.id.replace(/[^a-z0-9]/gi,'_')}"></div>
+  grid.innerHTML = children.map(c => {
+    const safeId = c.id.replace(/[^a-z0-9]/gi,'_');
+    return `
+    <div class="qr-item" id="qritem-${safeId}">
+      <div id="qr-${safeId}"></div>
       <div class="qr-name">${c.avatar} ${c.name}</div>
       <div class="qr-id">${c.id}</div>
       ${c.grade ? `<div class="qr-id">${c.grade}</div>` : ''}
-    </div>
-  `).join('');
+      <button class="btn btn-secondary btn-sm" style="margin-top:0.5rem;width:100%" onclick="downloadQR('${safeId}','${c.name.replace(/'/g,"\\'")}')">
+        ⬇️ Descargar
+      </button>
+    </div>`;
+  }).join('');
 
   children.forEach(c => {
     const safeId = c.id.replace(/[^a-z0-9]/gi,'_');
@@ -775,13 +840,60 @@ function renderQRCodes() {
       try {
         new QRCode(el, {
           text: c.id,
-          width: 120, height: 120,
+          width: 130, height: 130,
           colorDark: '#1a1a2e', colorLight: '#ffffff',
           correctLevel: QRCode.CorrectLevel.M
         });
       } catch(e) {}
     }
   });
+}
+
+function downloadQR(safeId, childName) {
+  const container = document.getElementById('qr-' + safeId);
+  if (!container) return;
+
+  // QRCode.js genera un canvas o una imagen según el navegador
+  const canvas = container.querySelector('canvas');
+  const img = container.querySelector('img');
+
+  if (canvas) {
+    // Crear un canvas más grande con nombre del niño abajo
+    const padded = document.createElement('canvas');
+    padded.width = canvas.width + 20;
+    padded.height = canvas.height + 50;
+    const ctx = padded.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, padded.width, padded.height);
+    ctx.drawImage(canvas, 10, 10);
+    ctx.fillStyle = '#1a1a2e';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(childName, padded.width / 2, canvas.height + 32);
+    const link = document.createElement('a');
+    link.download = `QR_${childName.replace(/\s+/g,'_')}.png`;
+    link.href = padded.toDataURL('image/png');
+    link.click();
+  } else if (img) {
+    // Fallback: crear canvas desde la imagen
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = img.width + 20;
+    tempCanvas.height = img.height + 50;
+    const ctx = tempCanvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
+    ctx.drawImage(img, 10, 10);
+    ctx.fillStyle = '#1a1a2e';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(childName, tempCanvas.width / 2, img.height + 32);
+    const link = document.createElement('a');
+    link.download = `QR_${childName.replace(/\s+/g,'_')}.png`;
+    link.href = tempCanvas.toDataURL('image/png');
+    link.click();
+  } else {
+    showNotif('⚠️ No se pudo generar la imagen, intenta de nuevo');
+  }
 }
 
 function printQRs() {
@@ -893,9 +1005,15 @@ function renderHistory() {
   }).join('');
 }
 
-function exportExcel() {
+async function exportExcel() {
   const monthStr = document.getElementById('exportMonth').value;
   const [year, month] = monthStr.split('-').map(Number);
+  showLoading(true);
+  try {
+    const data = await apiGet({ action: 'getAttendance', month: monthStr });
+    if (data.attendance) attendance = [...attendance.filter(a => a.month !== monthStr), ...data.attendance];
+  } catch(e) {}
+  showLoading(false);
   const records = attendance.filter(a => a.month === monthStr);
 
   if (!records.length) {
@@ -990,9 +1108,6 @@ function formatDateDisplay(dateStr) {
   const d = new Date(dateStr + 'T12:00:00');
   return d.toLocaleDateString('es-ES', { weekday:'short', day:'numeric', month:'short' });
 }
-
-function saveChildren() { localStorage.setItem('children', JSON.stringify(children)); }
-function saveAttendance() { localStorage.setItem('attendance', JSON.stringify(attendance)); }
 
 function closeModal(id) { document.getElementById(id).classList.remove('active'); }
 
